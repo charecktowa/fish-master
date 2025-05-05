@@ -18,36 +18,24 @@ def setup_logging(verbose=False):
 
 
 def clean_directory_name(name):
-    """Convert scientific names to valid directory names"""
+    """Convert scientific names to valid parts of filenames"""
     if pd.isna(name):
         return "unknown"
     # Convert to lowercase and replace spaces with underscores
     name = str(name).lower().strip()
     name = re.sub(r"\s+", "_", name)
-    # Remove any characters that aren't suitable for directory names
+    # Remove any characters that aren't suitable for filenames (adjust as needed)
     name = re.sub(r"[^\w_-]", "", name)
     return name
 
 
-def create_directory_structure(df, base_dir="dataset"):
-    """Create the directory structure based on species"""
-    # Create main dataset directory
+def ensure_base_directory(base_dir="dataset"):
+    """Ensure the base directory exists"""
     if not os.path.exists(base_dir):
         os.makedirs(base_dir)
         logging.info(f"Created base directory: {base_dir}")
-
-    # Get unique scientific names and create directories
-    unique_species = df["scientific_name"].dropna().unique()
-
-    created_dirs = 0
-    for species in unique_species:
-        clean_name = clean_directory_name(species)
-        species_dir = os.path.join(base_dir, clean_name)
-        if not os.path.exists(species_dir):
-            os.makedirs(species_dir)
-            created_dirs += 1
-
-    logging.info(f"Created {created_dirs} species directories")
+    else:
+        logging.info(f"Base directory already exists: {base_dir}")
     return base_dir
 
 
@@ -63,31 +51,60 @@ def download_image(url, save_path):
         return True
     except Exception as e:
         logging.error(f"Error downloading {url}: {e}")
+        # Attempt to remove partially downloaded file if error occurs
+        if os.path.exists(save_path):
+            try:
+                os.remove(save_path)
+            except OSError as oe:
+                logging.error(f"Error removing partial file {save_path}: {oe}")
         return False
 
 
 def download_all_images(df, base_dir="dataset", delay=0.15):
-    """Download all images from the dataframe"""
+    """Download all images from the dataframe into the base directory"""
     success_count = 0
     error_count = 0
 
     # Use tqdm for progress bar
     for idx, row in tqdm(df.iterrows(), total=len(df), desc="Downloading images"):
+        # Skip rows with missing scientific name or image URL
         if pd.isna(row["scientific_name"]) or pd.isna(row["image_url"]):
+            logging.debug(f"Skipping row {idx} due to missing data.")
             continue
 
         clean_name = clean_directory_name(row["scientific_name"])
-        species_dir = clean_name
+        # Use the dataframe index as the file number for uniqueness
+        file_number = idx
 
-        # Create a unique filename using the scientific name and observation ID
+        # Create a unique filename using the scientific name and file number
         try:
-            obs_id = row["url"].split("/")[-1]
-            filename = f"{clean_name}_{obs_id}.jpg"
-        except:
-            # Fallback to index if URL parsing fails
-            filename = f"{clean_name}_image_{idx}.jpg"
+            # Optionally, try to include observation ID for more context
+            obs_id_part = ""
+            try:
+                # Extract a unique identifier from the URL, assuming it's the last part
+                obs_id = str(row["url"]).split("/")[-1]
+                # Ensure obs_id is valid for filename, remove non-alphanumeric
+                obs_id = re.sub(r"\W+", "", obs_id)
+                if obs_id:  # If a valid obs_id was extracted
+                    obs_id_part = f"_{obs_id}"  # Include it in the filename
+            except Exception as e:
+                # Log if obs_id extraction fails but continue with index
+                logging.debug(
+                    f"Could not parse observation ID from URL {row['url']} for row {idx}: {e}. Using index only."
+                )
 
-        save_path = os.path.join(base_dir, species_dir, filename)
+            # Construct filename including the file number (index)
+            filename = f"{clean_name}{obs_id_part}_{file_number}.jpg"
+
+        except Exception as e:
+            # Fallback filename using only index if any other error occurs
+            logging.warning(
+                f"Error generating filename for row {idx}: {e}. Using basic index format."
+            )
+            filename = f"{clean_name}_image_{file_number}.jpg"
+
+        # Define the full path to save the image in the base directory
+        save_path = os.path.join(base_dir, filename)
 
         # Skip if file already exists
         if os.path.exists(save_path):
@@ -107,19 +124,33 @@ def download_all_images(df, base_dir="dataset", delay=0.15):
 
 
 def process_data(csv_file, output_dir="dataset", delay=0.15, keep_cols=None):
-    """Process the data and download images"""
+    """Process the data and download images into a single directory"""
     logging.info(f"Reading data from {csv_file}")
-    df = pd.read_csv(csv_file, low_memory=False)
+    try:
+        df = pd.read_csv(csv_file, low_memory=False)
+    except FileNotFoundError:
+        logging.error(f"Error: CSV file not found at {csv_file}")
+        return
+    except Exception as e:
+        logging.error(f"Error reading CSV file {csv_file}: {e}")
+        return
 
-    # Keep only necessary columns for memory efficiency if specified
+    # Check if necessary columns exist
     if keep_cols:
+        missing_cols = [col for col in keep_cols if col not in df.columns]
+        if missing_cols:
+            logging.error(
+                f"Error: Missing required columns in CSV: {', '.join(missing_cols)}"
+            )
+            return
+        # Keep only necessary columns for memory efficiency if specified
         df = df[keep_cols]
 
-    # Create directory structure
-    base_dir = create_directory_structure(df, output_dir)
+    # Ensure the base output directory exists
+    base_dir = ensure_base_directory(output_dir)
 
     # Download images
-    logging.info("Starting image downloads")
+    logging.info(f"Starting image downloads into {base_dir}")
     success_count, error_count = download_all_images(df, base_dir, delay)
 
     logging.info(
@@ -130,14 +161,16 @@ def process_data(csv_file, output_dir="dataset", delay=0.15, keep_cols=None):
 def main():
     """Main function to handle command line arguments and run the program"""
     parser = argparse.ArgumentParser(
-        description="Download nature observation images by species"
+        description="Download nature observation images by species into a single directory"
     )
-    parser.add_argument("--csv_file", help="Path to the observations CSV file")
+    parser.add_argument(
+        "--csv_file", help="Path to the observations CSV file"
+    )  # Made csv_file mandatory
     parser.add_argument(
         "--output-dir",
         "-o",
         default="dataset",
-        help="Directory to save images (default: dataset)",
+        help="Directory to save all images (default: dataset)",
     )
     parser.add_argument(
         "--delay",
